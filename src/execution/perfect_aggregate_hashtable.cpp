@@ -1,5 +1,12 @@
 #include "duckdb/execution/perfect_aggregate_hashtable.hpp"
 
+#include "duckdb/common/vector/vector_iterator.hpp"
+#include "duckdb/common/vector/vector_writer.hpp"
+#include "duckdb/function/aggregate_state_serialization.hpp"
+#include "duckdb/storage/buffer_manager.hpp"
+#include "duckdb/execution/aggregate_state_spilling.hpp"
+#include "duckdb/execution/aggregate_hashtable.hpp"
+
 #include "duckdb/common/clustered_aggregate.hpp"
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/row_operations/row_operations.hpp"
@@ -130,7 +137,7 @@ static inline void CheckGroupInRange(uint64_t group, idx_t total_groups) {
 	}
 }
 
-void PerfectAggregateHashTable::AddChunk(DataChunk &groups, DataChunk &payload) {
+void PerfectAggregateHashTable::PrepareChunk(DataChunk &groups, DataChunk &payload) {
 	const auto row_count = groups.size();
 	// first we need to find the location in the HT of each of the groups
 	FlatVector::SetSize(addresses, row_count);
@@ -148,6 +155,11 @@ void PerfectAggregateHashTable::AddChunk(DataChunk &groups, DataChunk &payload) 
 
 	// evaluate every aggregate filter once for this chunk
 	filter_set.ApplyFilters(payload);
+}
+
+void PerfectAggregateHashTable::AddChunk(DataChunk &payload) {
+	const auto row_count = addresses.size();
+	auto address_data = FlatVector::GetDataMutable<uintptr_t>(addresses);
 	if (AddChunkClustered(address_data, payload)) {
 		return;
 	}
@@ -324,7 +336,7 @@ static void ReconstructGroupVector(uint32_t group_values[], Value &min, idx_t re
 	}
 }
 
-void PerfectAggregateHashTable::Scan(idx_t &scan_position, DataChunk &result) {
+idx_t PerfectAggregateHashTable::ScanGroups(idx_t &scan_position, DataChunk &result, idx_t max_groups) {
 	auto data_pointers = FlatVector::GetDataMutable<data_ptr_t>(addresses);
 	uint32_t group_values[STANDARD_VECTOR_SIZE];
 
@@ -336,7 +348,7 @@ void PerfectAggregateHashTable::Scan(idx_t &scan_position, DataChunk &result) {
 			data_pointers[entry_count] = data + tuple_size * scan_position;
 			group_values[entry_count] = NumericCast<uint32_t>(scan_position);
 			entry_count++;
-			if (entry_count == STANDARD_VECTOR_SIZE) {
+			if (entry_count == max_groups) {
 				scan_position++;
 				break;
 			}
@@ -344,13 +356,288 @@ void PerfectAggregateHashTable::Scan(idx_t &scan_position, DataChunk &result) {
 	}
 	if (entry_count == 0) {
 		// no entries found
-		return;
+		return 0;
 	}
 	// first reconstruct the groups from the group index
 	idx_t shift = total_required_bits;
 	for (idx_t i = 0; i < grouping_columns; i++) {
 		shift -= required_bits[i];
 		ReconstructGroupVector(group_values, group_minima[i], required_bits[i], shift, entry_count, result.data[i]);
+	}
+	FlatVector::SetSize(addresses, entry_count);
+	return entry_count;
+}
+
+idx_t PerfectAggregateHashTable::ArenaAllocationSize() const {
+	auto size = aggregate_allocator->AllocationSize();
+	for (auto &arena : stored_allocators) {
+		size += arena->AllocationSize();
+	}
+	return size;
+}
+
+static optional_idx StringHeapSize(const AggregateStateField &field, const LogicalType &type, const_data_ptr_t state) {
+	switch (field.kind) {
+	case AggregateFieldKind::OPTIONAL_VALUE:
+		if (!Load<bool>(state + field.field_offset)) {
+			return 0;
+		}
+		return StringHeapSize(field.children[0], type, state);
+	case AggregateFieldKind::STRUCT:
+		if (field.children.size() == 1) {
+			return StringHeapSize(field.children[0], StructType::GetChildTypes(type)[0].second,
+			                      state + field.field_offset);
+		}
+		break;
+	case AggregateFieldKind::PRIMITIVE: {
+		if (type.InternalType() == PhysicalType::VARCHAR) {
+			const auto value = Load<string_t>(state + field.field_offset);
+			return value.IsInlined() ? 0 : value.GetSize();
+		}
+		break;
+	}
+	default:
+		break;
+	}
+	return optional_idx();
+}
+
+static bool ReserveStringUpdates(const Vector &values, const SelectionVector &selection, const Vector &addresses,
+                                 vector<idx_t> &heap_sizes, idx_t &remaining) {
+	const auto slots = FlatVector::GetData<uintptr_t>(addresses);
+	for (auto entry : values.ValidValues<string_t>()) {
+		const auto slot = slots[selection.get_index(entry.GetIndex())];
+		CheckGroupInRange(slot, heap_sizes.size());
+		auto &held = heap_sizes[slot];
+		const auto &value = entry.GetValue();
+		if (value.IsInlined()) {
+			// An inline replacement loses the group's reference to its heap buffer.
+			held = 0;
+			continue;
+		}
+		if (held >= value.GetSize()) {
+			continue;
+		}
+		const auto bytes = NextPowerOfTwo(value.GetSize());
+		if (bytes > remaining) {
+			return false;
+		}
+		remaining -= bytes;
+	}
+	return true;
+}
+
+bool PerfectAggregateHashTable::ReserveStringResults(const AggregateStateSpillPlan &plan, idx_t block_size,
+                                                     idx_t &available, optional_ptr<DataChunk> input) {
+	const auto budget = MinValue(block_size, available);
+	auto remaining = budget;
+	idx_t new_bytes = 0;
+	vector<idx_t> heap_sizes;
+	idx_t offset = 0;
+	idx_t payload_idx = 0;
+	for (idx_t i = 0; i < plan.state_layouts.size(); i++) {
+		const auto &state = plan.state_layouts[i];
+		const auto &aggregate = layout_ptr->GetAggregates()[i];
+		const auto base = data + offset;
+		offset += aggregate.payload_size;
+		const auto column = payload_idx;
+		payload_idx += aggregate.child_count;
+		if (plan.FixedListElementWidth(i, aggregate) || !plan.HasArenaReferences(i)) {
+			continue;
+		}
+		if (aggregate.function.GetReturnType().InternalType() != PhysicalType::VARCHAR ||
+		    aggregate.function.HasExportAggregateStateCallback()) {
+			return false;
+		}
+		optional_ptr<const Vector> values;
+		optional_ptr<const AggregateFilterData> filter;
+		if (input) {
+			if (aggregate.child_count != 1 || input->data[column].GetType().InternalType() != PhysicalType::VARCHAR) {
+				return false;
+			}
+			if (aggregate.filter) {
+				filter = filter_set.GetFilterData(i);
+			}
+			const auto &column_values = filter ? filter->filtered_payload.data[column] : input->data[column];
+			if (column_values.size()) {
+				values = column_values;
+				heap_sizes.resize(total_groups);
+			}
+		}
+		for (idx_t slot = 0; slot < total_groups; slot++) {
+			if (!group_is_set[slot]) {
+				continue;
+			}
+			const auto size = StringHeapSize(state.field, state.type, base + tuple_size * slot);
+			if (!size.IsValid() || size.GetIndex() > remaining) {
+				return false;
+			}
+			remaining -= size.GetIndex();
+			if (values) {
+				heap_sizes[slot] = size.GetIndex();
+			}
+		}
+		if (!values) {
+			continue;
+		}
+		const auto before = remaining;
+		const auto &selection =
+		    filter && !filter->all_selected ? filter->true_sel : *FlatVector::IncrementalSelectionVector();
+		if (!ReserveStringUpdates(*values, selection, addresses, heap_sizes, remaining)) {
+			return false;
+		}
+		new_bytes += before - remaining;
+	}
+	// Crossing the end of the current block can require doubling it even for a small update.
+	const auto head = aggregate_allocator->GetPosition().chunk;
+	if (head && new_bytes > head->maximum_size - head->current_position &&
+	    aggregate_allocator->AllocationSize() > available) {
+		return false;
+	}
+	available -= budget - remaining;
+	return true;
+}
+
+bool PerfectAggregateHashTable::SingleGroupExceeds(const AggregateStateSpillPlan &plan, idx_t available,
+                                                   idx_t list_width, idx_t input_rows) {
+	D_ASSERT(list_width && input_rows >= measured_rows);
+	// Each new input row can add at most one element to each LIST in a group.
+	const auto upper_bound = largest_measured_list + (input_rows - measured_rows);
+	if (upper_bound <= DConstants::MAX_VECTOR_SIZE &&
+	    VectorBuffer::GetReserveSize(upper_bound) <= available / list_width) {
+		return false;
+	}
+	idx_t largest = 0;
+	if (ListResultExceeds(plan, available, 1, &largest)) {
+		return true;
+	}
+	measured_rows = input_rows;
+	largest_measured_list = largest;
+	return false;
+}
+
+bool PerfectAggregateHashTable::ListResultExceeds(const AggregateStateSpillPlan &plan, idx_t available,
+                                                  idx_t max_groups, optional_ptr<idx_t> largest_list) const {
+	for (idx_t start = 0; start < total_groups;) {
+		idx_t end = start;
+		idx_t count = 0;
+		while (end < total_groups && count < max_groups) {
+			count += group_is_set[end++];
+		}
+		idx_t remaining = available;
+		idx_t offset = 0;
+		for (idx_t i = 0; i < plan.state_layouts.size(); i++) {
+			auto &state = plan.state_layouts[i];
+			auto &aggr = layout_ptr->GetAggregates()[i];
+			const auto field_offset = offset + state.field.field_offset;
+			offset += aggr.payload_size;
+			const auto width = plan.FixedListElementWidth(i, aggr);
+			if (!width) {
+				continue;
+			}
+			idx_t elements = 0;
+			for (idx_t slot = start; slot < end; slot++) {
+				if (!group_is_set[slot]) {
+					continue;
+				}
+				const auto list = Load<LinkedList>(data + tuple_size * slot + field_offset);
+				if (largest_list) {
+					*largest_list = MaxValue(*largest_list, list.total_capacity);
+				}
+				elements += list.total_capacity;
+				if (elements > DConstants::MAX_VECTOR_SIZE) {
+					return true;
+				}
+			}
+			if (elements) {
+				const auto capacity = VectorBuffer::GetReserveSize(elements);
+				if (capacity > remaining / width) {
+					return true;
+				}
+				remaining -= capacity * width;
+			}
+		}
+		start = end;
+	}
+	return false;
+}
+
+void PerfectAggregateHashTable::MoveToRadix(ClientContext &context, const vector<LogicalType> &group_types,
+                                            GroupedAggregateHashTable &target) {
+	D_ASSERT(HasSingleArena() && target.Count() == 0);
+	auto arena = target.GetAggregateAllocator();
+	aggregate_allocator->Move(*arena);
+	RowOperationsState state(*arena);
+	DataChunk groups;
+	groups.Initialize(Allocator::Get(context), group_types);
+	Vector targets(LogicalType::POINTER);
+	idx_t position = 0;
+	while (ScanGroups(position, groups)) {
+		target.FindOrCreateGroups(groups, targets);
+		VectorOperations::AddInPlace(targets, NumericCast<int64_t>(target.GetLayout().GetAggrOffset()));
+		RowOperations::CombineStates(state, *layout_ptr, addresses, targets);
+		groups.Reset();
+	}
+}
+
+void PerfectAggregateHashTable::Export(ClientContext &context, const vector<LogicalType> &group_types,
+                                       const AggregateStateSpillPlan &plan,
+                                       vector<unique_ptr<ColumnDataCollection>> &exported, idx_t radix_bits) {
+	auto &allocator = Allocator::Get(context);
+	ArenaAllocator scratch(allocator);
+	DataChunk groups, batch, slice;
+	groups.Initialize(allocator, group_types);
+	batch.Initialize(allocator, plan.exported_types);
+	slice.Initialize(allocator, plan.exported_types);
+	auto &aggregates = layout_ptr->GetAggregates();
+	auto max_groups = idx_t(STANDARD_VECTOR_SIZE);
+	for (idx_t i = 0; i < aggregates.size(); i++) {
+		if (plan.HasArenaReferences(i) && !plan.FixedListElementWidth(i, aggregates[i])) {
+			max_groups = 1;
+			break;
+		}
+	}
+	// Bound variable state materialization to a block; a single large group is indivisible.
+	const auto block_size = BufferManager::GetBufferManager(context).GetBlockAllocSize();
+	while (max_groups > 1 && ListResultExceeds(plan, block_size, max_groups)) {
+		max_groups /= 2;
+	}
+	Vector state_addresses(LogicalType::POINTER);
+	SelectionVector selection(STANDARD_VECTOR_SIZE);
+	idx_t position = 0;
+	while (ScanGroups(position, groups, max_groups)) {
+		batch.Reset();
+		for (idx_t col = 0; col < groups.ColumnCount(); col++) {
+			batch.data[col].Reference(groups.data[col]);
+		}
+		groups.Hash(batch.data[groups.ColumnCount()]);
+		auto pointers = addresses.Values<data_ptr_t>();
+		idx_t offset = 0;
+		for (idx_t col = 0; col < aggregates.size(); col++) {
+			auto &aggregate = aggregates[col];
+			{
+				auto writer = FlatVector::Writer<data_ptr_t>(state_addresses, groups.size());
+				for (auto entry : pointers) {
+					writer.WriteValue(entry.GetValue() + offset);
+				}
+			}
+			auto &result = batch.data[groups.ColumnCount() + 1 + col];
+			AggregateStateSerialization::SerializeStates(aggregate.function, aggregate.GetFunctionData(),
+			                                             plan.state_layouts[col], state_addresses, groups.size(),
+			                                             result, scratch, 0);
+			offset += aggregate.payload_size;
+		}
+		batch.SetChildCardinality(groups.size());
+		AggregateStateSpilling::AppendToPartitions(context, batch, groups.ColumnCount(), radix_bits, exported, slice,
+		                                           selection);
+		groups.Reset();
+		scratch.Reset();
+	}
+}
+
+void PerfectAggregateHashTable::Scan(idx_t &scan_position, DataChunk &result, idx_t max_groups) {
+	if (!ScanGroups(scan_position, result, max_groups)) {
+		return;
 	}
 	// then construct the payloads
 	if (!scan_row_state) {
